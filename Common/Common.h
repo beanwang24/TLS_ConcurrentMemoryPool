@@ -15,6 +15,7 @@ const size_t NPAGES = 129;
 //抢取对象头四个或者头八个字节，void*的别名，本省是内存，只能我们自己取
 inline static void*& NEXT_OBJ(void* obj)
 {
+    //*(T**)&xxx可以让一个地址赋值到当前指针指向变量的前4/8个字节上(取决于平台)
     return *((void**)obj);   // 先强转为void**,然后解引用就是一个void*
 }
 
@@ -181,6 +182,138 @@ public:
     }
 };
 
+#ifdef _WIN32
+typedef size_t PageID;
+#else
+typedef long long PageID;
+#endif //_WIN32
 
 
-#endif //MEMORYPOOL_COMMON_H
+//Span是一个跨度，既可以分配内存出去，也是负责将内存回收回来到PageCache合并
+//是一链式结构，定义为结构体就行，避免需要很多的友元
+struct Span
+{
+    PageID _pageid = 0;//页号
+    size_t _npage = 0;//页数
+
+    Span* _prev = nullptr;
+    Span* _next = nullptr;
+
+    void* _list = nullptr;//链接对象的自由链表，后面有对象就不为空，没有对象就是空
+    size_t _objsize = 0;//对象的大小
+
+    size_t _usecount = 0;//对象使用计数,
+};
+
+//和上面的Freelist一样，各个接口自己实现，双向带头循环的Span链表
+class SpanList
+{
+public:
+    Span* _head;
+    std::mutex _mutex;
+
+public:
+    SpanList()
+    {
+        _head = new Span;
+        _head->_next = _head;
+        _head->_prev = _head;
+    }
+
+    ~SpanList()//释放链表的每个节点
+    {
+        Span * cur = _head->_next;
+        while (cur != _head)
+        {
+            Span* next = cur->_next;
+            delete cur;
+            cur = next;
+        }
+        delete _head;
+        _head = nullptr;
+    }
+
+    //防止拷贝构造和赋值构造，将其封死，没有拷贝的必要，不然就自己会实现浅拷贝
+    SpanList(const SpanList&) = delete;
+    SpanList& operator=(const SpanList&) = delete;
+
+    //左闭右开
+    Span* Begin()//返回第一个数据的指针
+    {
+        return _head->_next;
+    }
+
+    Span* End()//最后一个的下一个指针
+    {
+        return _head;
+    }
+
+    bool Empty()
+    {
+        return _head->_next == _head;
+    }
+
+    //在pos位置的前面插入一个newspan
+    void Insert(Span* cur, Span* newspan)
+    {
+        Span* prev = cur->_prev;
+
+        //prev newspan cur
+        prev->_next = newspan;
+        newspan->_next = cur;
+
+        newspan->_prev = prev;
+        cur->_prev = newspan;
+    }
+
+    //删除pos位置的节点
+    void Erase(Span* cur)//此处只是单纯的把pos拿出来，并没有释放掉，后面还有用处
+    {
+        Span* prev = cur->_prev;
+        Span* next = cur->_next;
+
+        prev->_next = next;
+        next->_prev = prev;
+    }
+
+    //尾插
+    void PushBack(Span* newspan)
+    {
+        Insert(End(), newspan);
+    }
+
+    //头插
+    void PushFront(Span* newspan)
+    {
+        Insert(Begin(), newspan);
+    }
+
+    //尾删
+    Span* PopBack()//实际是将尾部位置的节点拿出来
+    {
+        Span* span = _head->_prev;
+        Erase(span);
+
+        return span;
+    }
+
+    //头删
+    Span* PopFront()//实际是将头部位置节点拿出来
+    {
+        Span* span = _head->_next;
+        Erase(span);
+
+        return span;
+    }
+
+    void Lock()
+    {
+        _mutex.lock();
+    }
+
+    void Unlock()
+    {
+        _mutex.unlock();
+    }
+};
+#endif
